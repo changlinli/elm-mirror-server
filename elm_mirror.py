@@ -432,15 +432,22 @@ def run_sync(
 
     print(f"Found {len(new_packages)} new packages to sync")
 
-    # Also find packages that previously failed and should be retried
+    # Also find packages that previously failed or are still pending and should be (re)tried
+    pending_packages = set(
+        pkg["id"] for pkg in registry["packages"]
+        if pkg["status"] == STATUS_PENDING
+    )
     failed_packages = set(
         pkg["id"] for pkg in registry["packages"]
         if pkg["status"] == STATUS_FAILED
     )
+    # Note: new_packages are already marked as pending, so we subtract them to avoid duplicates
+    pending_packages -= set(new_packages)
+    print(f"Found {len(pending_packages)} previously pending packages to sync")
     print(f"Found {len(failed_packages)} previously failed packages to retry")
 
-    # Combine new and failed packages for syncing
-    packages_to_sync = new_packages + list(failed_packages)
+    # Combine new, pending, and failed packages for syncing
+    packages_to_sync = new_packages + list(pending_packages) + list(failed_packages)
 
     # Filter by package list if provided
     # Note: we only filter, we don't mark packages as IGNORED here.
@@ -458,7 +465,9 @@ def run_sync(
 
     for i, pkg_id in enumerate(packages_to_sync, 1):
         if pkg_id in failed_packages:
-            print(f"[{i}/{len(packages_to_sync)}] Retrying {pkg_id}...")
+            print(f"[{i}/{len(packages_to_sync)}] Retrying failed {pkg_id}...")
+        elif pkg_id in pending_packages:
+            print(f"[{i}/{len(packages_to_sync)}] Retrying pending {pkg_id}...")
         else:
             print(f"[{i}/{len(packages_to_sync)}] Syncing {pkg_id}...")
 
