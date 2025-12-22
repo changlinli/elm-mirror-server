@@ -70,6 +70,8 @@ One script (`elm_mirror.py`) with three subcommands:
 **`sync`**
 - `--mirror-content` - mirror directory (default: `.`)
 - `--package-list` - JSON file for selective sync (optional)
+- `--github-token` - GitHub personal access token (optional, falls back to `GITHUB_TOKEN` env var)
+- `--github-rate-limit` - max GitHub requests per hour (default: `4000`)
 
 **`serve`**
 - `--mirror-content` - mirror directory (default: `.`)
@@ -78,6 +80,8 @@ One script (`elm_mirror.py`) with three subcommands:
 - `--port` - port to listen on (default: `8000`)
 - `--host` - interface to bind (default: `127.0.0.1`)
 - `--package-list` - for background sync (only relevant if `--sync-interval` set)
+- `--github-token` - GitHub personal access token (optional, falls back to `GITHUB_TOKEN` env var)
+- `--github-rate-limit` - max GitHub requests per hour (default: `4000`)
 
 **`verify`**
 - `--mirror-content` - mirror directory (default: `.`)
@@ -152,3 +156,62 @@ The server uses Python's built-in `wsgiref` module:
 - Standalone: `python elm_mirror.py serve ...` uses `wsgiref.simple_server`
 - CGI: Can be invoked via `wsgiref.handlers.CGIHandler` (auto-detected via `GATEWAY_INTERFACE` env var)
 - No third-party dependencies required
+
+---
+
+## GitHub Authentication and Rate Limiting
+
+Package zip files are downloaded from GitHub. Without authentication, GitHub limits requests to **60 per hour** per IP address. With a personal access token, this increases to **5,000 per hour**.
+
+### Configuration
+
+Both `sync` and `serve` commands accept:
+
+```
+--github-token TOKEN      GitHub personal access token
+--github-rate-limit N     Max requests per hour (default: 4000)
+```
+
+The token can also be provided via the `GITHUB_TOKEN` environment variable (CLI argument takes precedence).
+
+### Usage Examples
+
+```bash
+# Using environment variable (recommended - keeps token out of process list)
+export GITHUB_TOKEN=ghp_xxxxxxxxxxxx
+python elm_mirror.py sync --mirror-content ./mirror
+
+# Using CLI argument
+python elm_mirror.py sync --github-token ghp_xxxxxxxxxxxx
+
+# Custom rate limit (e.g., for GitHub Enterprise with 15,000/hr limit)
+python elm_mirror.py sync --github-rate-limit 10000
+
+# With background sync in serve mode
+python elm_mirror.py serve --base-url http://localhost:8000 \
+    --sync-interval 3600 --github-rate-limit 4000
+```
+
+### Creating a GitHub Token
+
+1. Go to GitHub Settings > Developer settings > Personal access tokens
+2. Choose "Fine-grained tokens" (recommended) or "Tokens (classic)"
+3. For public Elm packages, no special permissions are needed - the token just increases rate limits
+4. Copy the token and store it securely
+
+### Rate Limiter Behavior
+
+The rate limiter uses a sliding window algorithm:
+- Tracks all GitHub requests within the last hour
+- Enforces a minimum interval between requests (e.g., ~0.9s for 4000 req/hr)
+- Automatically pauses when approaching the limit
+- Prints status messages when rate limiting is active
+
+The default limit of 4000/hour leaves a buffer below GitHub's 5000/hour authenticated limit, allowing for other tools or manual API usage.
+
+### Without Authentication
+
+If no token is provided:
+- Downloads still work but are limited to 60/hour
+- A warning is printed at sync start
+- Rate limiting still applies (respects `--github-rate-limit`)

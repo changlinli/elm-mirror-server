@@ -6,9 +6,12 @@ A Python script to create and serve a read-only mirror of the Elm package server
 Supports syncing packages, serving them via HTTP, and verifying integrity.
 
 Usage:
-    python elm_mirror.py sync [--mirror-content DIR] [--package-list FILE]
-    python elm_mirror.py serve --base-url URL [--mirror-content DIR] [--port PORT] [--host HOST] [--sync-interval SECS] [--package-list FILE]
+    python elm_mirror.py sync [--mirror-content DIR] [--package-list FILE] [--github-token TOKEN] [--github-rate-limit N]
+    python elm_mirror.py serve --base-url URL [--mirror-content DIR] [--port PORT] [--host HOST] [--sync-interval SECS] [--package-list FILE] [--github-token TOKEN] [--github-rate-limit N]
     python elm_mirror.py verify [--mirror-content DIR]
+
+Environment Variables:
+    GITHUB_TOKEN: GitHub personal access token (fallback if --github-token not provided)
 """
 
 import argparse
@@ -34,12 +37,91 @@ from wsgiref.simple_server import make_server
 ELM_PACKAGE_SERVER = "https://package.elm-lang.org"
 DEFAULT_PORT = 8000
 DEFAULT_HOST = "127.0.0.1"
+DEFAULT_GITHUB_RATE_LIMIT = 4000  # requests per hour (leaves buffer from 5000 limit)
 
 # Status values for packages
 STATUS_SUCCESS = "success"
 STATUS_PENDING = "pending"
 STATUS_FAILED = "failed"
 STATUS_IGNORED = "ignored"
+
+
+# =============================================================================
+# GitHub Rate Limiter
+# =============================================================================
+
+
+class GitHubRateLimiter:
+    """
+    Rate limiter for GitHub API requests.
+
+    Implements a sliding window rate limiter that tracks request timestamps
+    and sleeps when necessary to stay under the configured rate limit.
+    """
+
+    def __init__(self, requests_per_hour: int = DEFAULT_GITHUB_RATE_LIMIT):
+        self.requests_per_hour = requests_per_hour
+        self.request_timestamps: list[float] = []
+        self.lock = threading.Lock()
+
+        # Calculate minimum interval between requests
+        # e.g., 4000 req/hour = 1 request per 0.9 seconds
+        self.min_interval = 3600.0 / requests_per_hour if requests_per_hour > 0 else 0
+
+    def wait_if_needed(self) -> None:
+        """Wait if necessary to stay under the rate limit."""
+        if self.requests_per_hour <= 0:
+            return  # No rate limiting
+
+        with self.lock:
+            now = time.time()
+
+            # Remove timestamps older than 1 hour
+            one_hour_ago = now - 3600
+            self.request_timestamps = [
+                ts for ts in self.request_timestamps if ts > one_hour_ago
+            ]
+
+            # Check if we're at the limit
+            if len(self.request_timestamps) >= self.requests_per_hour:
+                # Wait until the oldest request falls outside the window
+                oldest = self.request_timestamps[0]
+                wait_time = oldest - one_hour_ago
+                if wait_time > 0:
+                    print(f"  Rate limit reached, waiting {wait_time:.1f}s...")
+                    time.sleep(wait_time)
+                    # Clean up again after sleeping
+                    now = time.time()
+                    one_hour_ago = now - 3600
+                    self.request_timestamps = [
+                        ts for ts in self.request_timestamps if ts > one_hour_ago
+                    ]
+
+            # Also enforce minimum interval between requests
+            if self.request_timestamps:
+                last_request = self.request_timestamps[-1]
+                time_since_last = now - last_request
+                if time_since_last < self.min_interval:
+                    sleep_time = self.min_interval - time_since_last
+                    time.sleep(sleep_time)
+
+            # Record this request
+            self.request_timestamps.append(time.time())
+
+    def get_stats(self) -> dict:
+        """Get current rate limiter statistics."""
+        with self.lock:
+            now = time.time()
+            one_hour_ago = now - 3600
+            recent_requests = len([
+                ts for ts in self.request_timestamps if ts > one_hour_ago
+            ])
+            return {
+                "requests_last_hour": recent_requests,
+                "limit_per_hour": self.requests_per_hour,
+                "remaining": self.requests_per_hour - recent_requests
+            }
+
 
 # =============================================================================
 # Registry Management
@@ -141,12 +223,17 @@ def should_sync_package(package_id: str, package_list: set[str] | None) -> bool:
 # =============================================================================
 
 
-def fetch_url(url: str, timeout: int = 30) -> bytes:
+def fetch_url(
+    url: str,
+    timeout: int = 30,
+    extra_headers: dict[str, str] | None = None
+) -> bytes:
     """Fetch a URL and return the response body as bytes."""
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "elm-mirror-server/1.0"}
-    )
+    headers = {"User-Agent": "elm-mirror-server/1.0"}
+    if extra_headers:
+        headers.update(extra_headers)
+
+    request = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return response.read()
 
@@ -186,9 +273,24 @@ def fetch_package_elm_json(author: str, name: str, version: str) -> dict:
     return fetch_json(url)
 
 
-def download_package_zip(zip_url: str, dest_path: Path) -> None:
+def download_package_zip(
+    zip_url: str,
+    dest_path: Path,
+    github_token: str | None = None,
+    rate_limiter: GitHubRateLimiter | None = None
+) -> None:
     """Download a package zip file to the destination path."""
-    data = fetch_url(zip_url, timeout=120)
+    extra_headers = None
+
+    # Add GitHub authorization if token provided and URL is from GitHub
+    if github_token and "github.com" in zip_url:
+        extra_headers = {"Authorization": f"Bearer {github_token}"}
+
+        # Apply rate limiting for GitHub requests
+        if rate_limiter:
+            rate_limiter.wait_if_needed()
+
+    data = fetch_url(zip_url, timeout=120, extra_headers=extra_headers)
 
     # Write to temp file first, then rename for atomicity
     temp_path = dest_path.with_suffix(".zip.tmp")
@@ -209,7 +311,9 @@ def compute_sha1(file_path: Path) -> str:
 def sync_package(
     mirror_dir: Path,
     package_id: str,
-    registry: dict
+    registry: dict,
+    github_token: str | None = None,
+    rate_limiter: GitHubRateLimiter | None = None
 ) -> bool:
     """
     Sync a single package. Returns True on success, False on failure.
@@ -240,7 +344,7 @@ def sync_package(
 
         # Download package zip
         zip_path = package_dir / "package.zip"
-        download_package_zip(zip_url, zip_path)
+        download_package_zip(zip_url, zip_path, github_token, rate_limiter)
 
         # Verify hash
         actual_hash = compute_sha1(zip_path)
@@ -258,9 +362,22 @@ def sync_package(
         return False
 
 
-def run_sync(mirror_dir: Path, package_list: set[str] | None) -> None:
+def run_sync(
+    mirror_dir: Path,
+    package_list: set[str] | None,
+    github_token: str | None = None,
+    github_rate_limit: int = DEFAULT_GITHUB_RATE_LIMIT
+) -> None:
     """Run a full sync operation."""
     print("Starting sync...")
+
+    # Set up rate limiter for GitHub requests
+    rate_limiter = GitHubRateLimiter(github_rate_limit) if github_rate_limit > 0 else None
+
+    if github_token:
+        print(f"Using GitHub authentication (rate limit: {github_rate_limit}/hour)")
+    else:
+        print("No GitHub token provided (unauthenticated rate limit: 60/hour)")
 
     # Ensure mirror directory exists
     mirror_dir.mkdir(parents=True, exist_ok=True)
@@ -322,7 +439,7 @@ def run_sync(mirror_dir: Path, package_list: set[str] | None) -> None:
     for i, pkg_id in enumerate(packages_to_sync, 1):
         print(f"[{i}/{len(packages_to_sync)}] Syncing {pkg_id}...")
 
-        if sync_package(mirror_dir, pkg_id, registry):
+        if sync_package(mirror_dir, pkg_id, registry, github_token, rate_limiter):
             success_count += 1
         else:
             fail_count += 1
@@ -335,6 +452,9 @@ def run_sync(mirror_dir: Path, package_list: set[str] | None) -> None:
     save_registry(mirror_dir, registry)
 
     print(f"\nSync complete: {success_count} succeeded, {fail_count} failed")
+    if rate_limiter:
+        stats = rate_limiter.get_stats()
+        print(f"GitHub requests this session: {stats['requests_last_hour']}")
 
 
 # =============================================================================
@@ -361,13 +481,18 @@ class ElmMirrorApp:
         path = environ.get("PATH_INFO", "/")
         method = environ.get("REQUEST_METHOD", "GET")
 
+        # Route requests
+        # Note: /all-packages accepts both GET and POST (Zokka uses POST)
+        if path == "/all-packages":
+            if method not in ("GET", "POST"):
+                return self._error_response(start_response, 405, "Method Not Allowed")
+            return self._serve_all_packages(start_response)
+
+        # All other endpoints only accept GET
         if method != "GET":
             return self._error_response(start_response, 405, "Method Not Allowed")
 
-        # Route requests
-        if path == "/all-packages":
-            return self._serve_all_packages(start_response)
-        elif path.startswith("/all-packages/since/"):
+        if path.startswith("/all-packages/since/"):
             return self._serve_all_packages_since(path, start_response)
         elif path.startswith("/packages/") and path.endswith("/endpoint.json"):
             return self._serve_endpoint_json(path, start_response)
@@ -549,7 +674,9 @@ def run_background_sync(
     mirror_dir: Path,
     package_list: set[str] | None,
     interval: int,
-    app: ElmMirrorApp
+    app: ElmMirrorApp,
+    github_token: str | None = None,
+    github_rate_limit: int = DEFAULT_GITHUB_RATE_LIMIT
 ) -> None:
     """Run sync in a background thread at the specified interval."""
     def sync_loop():
@@ -557,7 +684,7 @@ def run_background_sync(
             time.sleep(interval)
             print(f"\n[Background sync] Starting sync...")
             try:
-                run_sync(mirror_dir, package_list)
+                run_sync(mirror_dir, package_list, github_token, github_rate_limit)
                 app.reload_registry()
                 print("[Background sync] Complete")
             except Exception as e:
@@ -573,7 +700,9 @@ def run_serve(
     host: str,
     port: int,
     sync_interval: int | None,
-    package_list: set[str] | None
+    package_list: set[str] | None,
+    github_token: str | None = None,
+    github_rate_limit: int = DEFAULT_GITHUB_RATE_LIMIT
 ) -> None:
     """Run the WSGI server."""
     app = ElmMirrorApp(mirror_dir, base_url)
@@ -581,7 +710,10 @@ def run_serve(
     # Start background sync if interval is specified
     if sync_interval is not None:
         print(f"Starting background sync every {sync_interval} seconds")
-        run_background_sync(mirror_dir, package_list, sync_interval, app)
+        run_background_sync(
+            mirror_dir, package_list, sync_interval, app,
+            github_token, github_rate_limit
+        )
 
     # Check if running as CGI
     if "GATEWAY_INTERFACE" in os.environ:
@@ -698,7 +830,22 @@ def main():
         "--package-list",
         type=str,
         default=None,
-        help="JSON file containing list of packages to sync (default: sync all)"
+        help="""JSON file containing list of packages to sync (default: sync all).
+The file should contain a JSON array of package identifiers. Example:
+  ["elm/core", "elm/html", "mdgriffith/elm-ui@2.0.0"]
+Use "author/name" to sync all versions, or "author/name@version" for a specific version."""
+    )
+    sync_parser.add_argument(
+        "--github-token",
+        type=str,
+        default=None,
+        help="GitHub personal access token for authentication (increases rate limit from 60 to 5000/hour). Falls back to GITHUB_TOKEN env var."
+    )
+    sync_parser.add_argument(
+        "--github-rate-limit",
+        type=int,
+        default=DEFAULT_GITHUB_RATE_LIMIT,
+        help=f"Maximum GitHub requests per hour (default: {DEFAULT_GITHUB_RATE_LIMIT}). Set to 0 to disable rate limiting."
     )
 
     # serve command
@@ -737,7 +884,22 @@ def main():
         "--package-list",
         type=str,
         default=None,
-        help="JSON file containing list of packages to sync (for background sync)"
+        help="""JSON file containing list of packages to sync (for background sync).
+The file should contain a JSON array of package identifiers. Example:
+  ["elm/core", "elm/html", "mdgriffith/elm-ui@2.0.0"]
+Use "author/name" to sync all versions, or "author/name@version" for a specific version."""
+    )
+    serve_parser.add_argument(
+        "--github-token",
+        type=str,
+        default=None,
+        help="GitHub personal access token for authentication (increases rate limit from 60 to 5000/hour). Falls back to GITHUB_TOKEN env var."
+    )
+    serve_parser.add_argument(
+        "--github-rate-limit",
+        type=int,
+        default=DEFAULT_GITHUB_RATE_LIMIT,
+        help=f"Maximum GitHub requests per hour (default: {DEFAULT_GITHUB_RATE_LIMIT}). Set to 0 to disable rate limiting."
     )
 
     # verify command
@@ -759,17 +921,27 @@ def main():
 
     if args.command == "sync":
         package_list = load_package_list(args.package_list)
-        run_sync(mirror_dir, package_list)
+        # Get GitHub token from CLI arg or environment variable
+        github_token = args.github_token or os.environ.get("GITHUB_TOKEN")
+        run_sync(
+            mirror_dir, package_list,
+            github_token=github_token,
+            github_rate_limit=args.github_rate_limit
+        )
 
     elif args.command == "serve":
         package_list = load_package_list(args.package_list)
+        # Get GitHub token from CLI arg or environment variable
+        github_token = args.github_token or os.environ.get("GITHUB_TOKEN")
         run_serve(
             mirror_dir=mirror_dir,
             base_url=args.base_url,
             host=args.host,
             port=args.port,
             sync_interval=args.sync_interval,
-            package_list=package_list
+            package_list=package_list,
+            github_token=github_token,
+            github_rate_limit=args.github_rate_limit
         )
 
     elif args.command == "verify":
