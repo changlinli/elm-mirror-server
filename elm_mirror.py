@@ -362,12 +362,12 @@ def sync_package(
         # Differentiate between temporary and permanent errors
         if e.code >= 500:
             # 5xx errors are temporary server errors - mark as FAILED to retry later
-            details = f"HTTP {e.code}: {e.reason}"
+            details = f"HTTP {e.code} when accessing {e.url}: {e.reason}"
             print(f"  Error syncing {package_id}: {details}")
             set_package_status(registry, package_id, STATUS_FAILED, details)
         else:
             # 4xx errors (including 404) are permanent - mark as IGNORED
-            details = f"HTTP {e.code}: {e.reason}"
+            details = f"HTTP {e.code} when accessing {e.url}: {e.reason}"
             print(f"  Error syncing {package_id}: {details}")
             set_package_status(registry, package_id, STATUS_IGNORED, details)
         return False
