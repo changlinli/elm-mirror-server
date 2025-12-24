@@ -124,7 +124,7 @@ Status values:
 ### Server Behavior
 
 - Static files served directly (elm.json, package.zip, etc.)
-- `/all-packages` - served from static file
+- `/all-packages` - served from static file (reconstructed from registry during sync)
 - `/all-packages/since/<N>` - computed dynamically from `registry.json`, includes ALL packages regardless of status
 - `/packages/<author>/<name>/<version>/endpoint.json` - generated dynamically with absolute URL from `--base-url`
 - Requests for `package.zip` of `failed`/`pending` packages return 5xx with descriptive error
@@ -132,9 +132,13 @@ Status values:
 ### Sync Behavior
 
 - Append-only (package unpublishing is not possible in Elm ecosystem)
+- ALL packages from the Elm server are tracked in `registry.json`, regardless of `--package-list`
+- The `--package-list` only controls which packages are downloaded, not which are tracked
+- The `all-packages` index is reconstructed from `registry.json` (no separate fetch needed)
 - Continue on individual package failures, track status in `registry.json`
 - Retry failed packages at end of sync run
 - Atomic updates to prevent inconsistent state on crash
+- Warns about entries in `--package-list` that don't exist on the Elm server
 
 ### Package List Format
 

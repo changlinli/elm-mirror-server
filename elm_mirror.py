@@ -27,8 +27,27 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import NotRequired, TypedDict
 from wsgiref.handlers import CGIHandler
 from wsgiref.simple_server import make_server
+
+
+# =============================================================================
+# Type Definitions
+# =============================================================================
+
+
+class PackageEntry(TypedDict):
+    """A single package entry in the registry."""
+    id: str        # e.g., "elm/core@1.0.0"
+    status: str    # one of STATUS_SUCCESS, STATUS_PENDING, STATUS_FAILED, STATUS_IGNORED
+    details: str   # error message or other details
+
+
+class Registry(TypedDict):
+    """The registry.json structure."""
+    packages: list[PackageEntry]
+    sync_checkpoint: NotRequired[int]  # tracks incremental sync progress
 
 # =============================================================================
 # Constants
@@ -128,7 +147,7 @@ class RateLimiter:
 # =============================================================================
 
 
-def load_registry(mirror_dir: Path) -> dict:
+def load_registry(mirror_dir: Path) -> Registry:
     """Load the registry from disk, or return an empty registry if not found."""
     registry_path = mirror_dir / "registry.json"
     if registry_path.exists():
@@ -137,7 +156,7 @@ def load_registry(mirror_dir: Path) -> dict:
     return {"packages": []}
 
 
-def save_registry(mirror_dir: Path, registry: dict) -> None:
+def save_registry(mirror_dir: Path, registry: Registry) -> None:
     """Save the registry to disk atomically."""
     registry_path = mirror_dir / "registry.json"
     temp_path = mirror_dir / "registry.json.tmp"
@@ -149,7 +168,7 @@ def save_registry(mirror_dir: Path, registry: dict) -> None:
     temp_path.replace(registry_path)
 
 
-def get_package_status(registry: dict, package_id: str) -> str | None:
+def get_package_status(registry: Registry, package_id: str) -> str | None:
     """Get the status of a package, or None if not in registry."""
     for pkg in registry["packages"]:
         if pkg["id"] == package_id:
@@ -157,7 +176,7 @@ def get_package_status(registry: dict, package_id: str) -> str | None:
     return None
 
 
-def set_package_status(registry: dict, package_id: str, status: str, details: str = "") -> None:
+def set_package_status(registry: Registry, package_id: str, status: str, details: str = "") -> None:
     """Set the status of a package, adding it if not present."""
     for pkg in registry["packages"]:
         if pkg["id"] == package_id:
@@ -174,6 +193,40 @@ def parse_package_id(package_id: str) -> tuple[str, str, str]:
     if not match:
         raise ValueError(f"Invalid package ID: {package_id}")
     return match.group(1), match.group(2), match.group(3)
+
+
+def generate_all_packages_index(registry: Registry) -> dict[str, list[str]]:
+    """
+    Generate the all-packages index from registry data.
+
+    Returns a dict mapping package names to version lists, e.g.:
+    {"elm/core": ["1.0.0", "1.0.1"], "elm/json": ["1.0.0"]}
+
+    All packages are included regardless of status (pending, success, failed, ignored).
+    """
+    all_packages: dict[str, list[str]] = {}
+
+    for pkg in registry["packages"]:
+        author, name, version = parse_package_id(pkg["id"])
+        pkg_name = f"{author}/{name}"
+        if pkg_name not in all_packages:
+            all_packages[pkg_name] = []
+        all_packages[pkg_name].append(version)
+
+    return all_packages
+
+
+def save_all_packages_index(mirror_dir: Path, registry: Registry) -> None:
+    """Generate and save the all-packages index from registry data."""
+    all_packages = generate_all_packages_index(registry)
+    all_packages_path = mirror_dir / "all-packages"
+    temp_path = mirror_dir / "all-packages.tmp"
+
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(all_packages, f)
+
+    # Atomic rename
+    temp_path.replace(all_packages_path)
 
 
 # =============================================================================
@@ -264,12 +317,6 @@ def fetch_all_packages_since(
 ) -> list[str]:
     """Fetch the list of all packages from the Elm package server."""
     url = f"{ELM_PACKAGE_SERVER}/all-packages/since/{since}"
-    return fetch_json(url, rate_limiter=rate_limiter)
-
-
-def fetch_all_packages(rate_limiter: RateLimiter | None = None) -> dict[str, list[str]]:
-    """Fetch the all-packages index (name -> versions mapping)."""
-    url = f"{ELM_PACKAGE_SERVER}/all-packages"
     return fetch_json(url, rate_limiter=rate_limiter)
 
 
@@ -421,16 +468,17 @@ def run_sync(
     packages added since the last completed sync. This is more efficient than
     fetching all packages every time.
 
-    Important notes about incremental sync:
-    1. We store the sync checkpoint (the 'since' value from the Elm server) as a
-       separate field in registry.json rather than deriving it from the number of
-       packages. This is because we might only sync a subset of packages (via
-       --package-list), which would cause the package count to be far lower than
-       what's on the main Elm server.
-    2. The sync_checkpoint is only updated after a sync completes successfully,
+    Important notes:
+    1. ALL packages from the Elm server are tracked in registry.json, regardless
+       of --package-list. This ensures the sync_checkpoint accurately reflects
+       the Elm server's package count, and allows later full syncs to work.
+    2. The --package-list only controls which packages are actually downloaded,
+       not which packages are tracked in the registry.
+    3. The sync_checkpoint is only updated after a sync completes successfully,
        so if a sync is interrupted, we'll retry from the same point.
-    3. We always retry failed and pending packages regardless of incremental mode,
-       even if they're not in the 'since' response.
+    4. We always retry failed and pending packages regardless of incremental mode.
+    5. The all-packages index is reconstructed from registry.json rather than
+       fetched from the Elm server, eliminating an extra HTTP request.
     """
     print("Starting sync...")
 
@@ -474,28 +522,20 @@ def run_sync(
     else:
         new_checkpoint = len(remote_packages)
 
-    # Fetch and save all-packages index
-    print("Fetching all-packages index...")
-    all_packages = fetch_all_packages(rate_limiter)
-    all_packages_path = mirror_dir / "all-packages"
-    with open(all_packages_path, "w", encoding="utf-8") as f:
-        json.dump(all_packages, f)
-
-    # Determine which packages need to be synced
-    # New packages are at the beginning of remote_packages (newest first)
+    # Add all new packages to registry as pending
+    # We track ALL packages regardless of --package-list so that:
+    # 1. The sync_checkpoint accurately reflects the Elm server's package count
+    # 2. A later full sync can download packages that were skipped
+    # 3. The all-packages index can be reconstructed from the registry
     new_packages = []
     for pkg_id in remote_packages:
         if pkg_id not in existing_ids:
-            # When a package list is provided, only add packages that match the list
-            # Packages outside the list are implicitly ignored (not tracked in registry)
-            if package_list is not None and not should_sync_package(pkg_id, package_list):
-                continue
             # Add to registry as pending
             registry["packages"].insert(0, {"id": pkg_id, "status": STATUS_PENDING, "details": ""})
             existing_ids.add(pkg_id)
             new_packages.append(pkg_id)
 
-    print(f"Found {len(new_packages)} new packages to sync")
+    print(f"Found {len(new_packages)} new packages in registry")
 
     # Also find packages that previously failed or are still pending and should be (re)tried
     # Note: These are always included regardless of incremental mode, as they might have
@@ -526,6 +566,17 @@ def run_sync(
         ]
         print(f"After filtering by package list: {len(packages_to_sync)} packages to sync")
 
+        # Warn about packages in --package-list that don't exist on the Elm server
+        for list_entry in package_list:
+            # Check if this entry matches any package in the registry
+            entry_matches = False
+            for pkg in registry["packages"]:
+                if should_sync_package(pkg["id"], {list_entry}):
+                    entry_matches = True
+                    break
+            if not entry_matches:
+                print(f"  Warning: '{list_entry}' in package list does not match any package on the Elm server")
+
     # Sync packages
     success_count = 0
     fail_count = 0
@@ -553,6 +604,10 @@ def run_sync(
 
     # Final save
     save_registry(mirror_dir, registry)
+
+    # Generate and save all-packages index from registry
+    # This is reconstructed from the registry rather than fetched from the Elm server
+    save_all_packages_index(mirror_dir, registry)
 
     print(f"\nSync complete: {success_count} succeeded, {fail_count} failed")
     print(f"Sync checkpoint updated to: {new_checkpoint}")
