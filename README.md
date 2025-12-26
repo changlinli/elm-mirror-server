@@ -160,6 +160,8 @@ To sync only specific packages, create a JSON file:
 ["elm/core", "elm/html", "mdgriffith/elm-ui@2.0.0"]
 ```
 
+If you leave off a version number then it will sync all versions of that package.
+
 Then run:
 ```bash
 python elm_mirror.py sync --package-list packages.json --mirror-content ./mirror
